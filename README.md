@@ -1,110 +1,69 @@
-# term-consistency-checker
-Glossary and consistency review for bilingual deliverables. Deterministic first, model only where it has to be
 # termcheck
 
-A small, finished product: paste a glossary, a source text and a translation, get back every place the deliverable breaks its own terminology. Runs as a web page or a CLI.
+Checks a translated deliverable against a glossary. Flags terms rendered outside the approved list, the same term rendered inconsistently, numbers that changed, and untranslated fragments. Web UI and CLI.
+
+## Run
 
 ```bash
 pip install -r requirements.txt
-python -m termcheck.server                      # http://127.0.0.1:8000, click "Load sample"
-python -m termcheck.cli data/sample_source.txt data/sample_target.txt \
-  -g data/glossary_ru_en.csv                    # no API key required
+
+make serve    # http://127.0.0.1:8000, click "Load sample"
+make check    # CLI against the sample files
+make eval     # 11 seeded-defect cases, currently 11/11 offline
+make verify   # 16 assertions
+
+export ANTHROPIC_API_KEY=...   # enables the adjudication pass
 ```
 
----
+## What the code does
 
-## Why this one
+Four checks in `termcheck/checks.py`, all deterministic, all sub-10ms:
 
-The other projects in this portfolio are tools. This is a product, and it was chosen against a filter:
+- **Glossary compliance, per aligned segment.** If a source segment contains an approved term and the matching target segment contains no approved rendering, that is an error. Alignment is positional; a segment-count mismatch is reported as a warning and the check falls back to whole-document scope.
+- **Internal consistency.** The same source term rendered two different approved ways in one document. `_non_overlapping_hits()` prevents the false positive where `provider` always looks present inside `service provider`.
+- **Numbers.** Present in one side and not the other. `1 500,00`, `1,500.00` and `1500` normalise equal.
+- **Script leakage.** Cyrillic in a Latin target, CJK in a non-`zh` target.
 
-| Test | This product |
-| --- | --- |
-| Is the pain acute and self-evident? | A client-returned deliverable over one wrong term is a real, expensive event in translation work. Nobody needs the problem explained. |
-| Is there urgency, or is it nice-to-have? | Terminology gets checked at 1am before a delivery deadline, or it does not get checked. |
-| Is onboarding near-zero? | Three text boxes. No account, no upload, no project setup, no CAT tool integration. |
-| Is there a distribution edge? | I work as a Russian–English interpreter. I have the problem, and I know where the people who share it are. |
+`termcheck/semantic.py` is the only model call, and it only runs on flags that failed the literal glossary pass — typically two or three per document. It asks one question: does the target segment contain an acceptable inflected variant of the approved term, or a real deviation? This exists because `поставщик услуг` and `поставщику услуг` are the same term with no string overlap at the end, and stemming gets Russian aspect pairs wrong.
 
-I built the thing I am the customer for. That is the whole thesis.
+The adjudication prompt offers `unclear` as a first-class verdict and states what each kind of mistake costs, rather than asking "is this okay?".
 
-## What it checks
+`--no-model` skips the pass entirely. Everything still runs, with more false positives, at zero cost.
 
-**Glossary compliance, per aligned segment.** If the source segment contains an approved term and the matching target segment contains no approved rendering of it, that is an error. Segment scoping matters more than it sounds: check the whole document at once and a correct rendering three sentences away silently clears a genuine miss. That exact bug appeared during development and is now what the alignment step exists to prevent.
+`termcheck/server.py` is a FastAPI app with one endpoint, `POST /api/check`. `termcheck/web/index.html` is the whole front end: three textareas, a findings rail, and a synchronized highlight — clicking a finding marks the term in the source and every candidate rendering in the target at once.
 
-**Internal consistency.** The same source term rendered two different approved ways in one deliverable. Both are correct in isolation; alternating between them is what a reviewer sends back.
+## Where things are
 
-**Numbers.** Present in source and absent in target, or the reverse. `1 500,00`, `1,500.00` and `1500` all compare equal, so formatting conventions do not generate noise.
-
-**Script leakage.** Cyrillic left in an English target, CJK in a Latin one. Cheap to detect, embarrassing to ship.
-
-## The design decision worth defending
-
-The model is called once, on one question, on a subset of flags.
-
-Everything above is regular expressions and set arithmetic. It runs in milliseconds, costs nothing, and cannot hallucinate. A changed number is a hard error that code catches perfectly; asking a language model to find it would be slower, more expensive, and *less* reliable.
-
-The model is asked exactly one thing that code does badly:
-
-> The approved term is **поставщик услуг**. The target says **поставщику услуг**. Same term, dative case, and the string comparison fails at the last character.
-
-Stemming handles some of this and gets Russian aspect pairs and Mandarin measure words wrong. So flags that fail the literal pass — and only those — go to the model with a narrow question: is an acceptable inflected variant present, or is this a real deviation? A typical document sends two or three flags rather than every sentence.
-
-The adjudication prompt is written to be unhelpful on purpose. It states that a false clear costs a client relationship and a false flag costs ten seconds, and it offers `unclear` as a first-class verdict. A model asked "is this okay?" says yes. A model told what each kind of mistake costs picks the cheaper mistake.
-
-`--no-model` turns the model pass off entirely. Everything still runs, with more false positives, at zero cost — a real mode, not a fallback.
-
-## Model choice
-
-Sonnet, temperature 0. The task is a bounded linguistic judgment against a written rule, one to three times per document. Haiku was tested first because the volume argument favours it, and it accepted paraphrases as inflected variants — the exact false-clear the tool exists to prevent. Opus adds nothing measurable here: morphological variant recognition is not where extra capability shows up.
-
-## Eval plan
-
-Ground truth by construction. Start from a target that is known clean, inject one specific defect, check whether it is reported.
-
-```bash
-python evals/run_eval.py             # 11 cases
-python evals/run_eval.py --no-model  # deterministic only, for comparison
-```
-
-Seven seeded defects — an unapproved synonym, a wrong legal term of art, a dropped term, a changed number, a dropped number, an inconsistent rendering, an untranslated fragment. Four cases that must stay clean — the unmodified text, two harmless rewordings, and one substitution of an accepted alternative, which should produce a `note` and never an error.
-
-The clean cases carry more weight than the seeded ones. A checker that flags everything has perfect recall and is worthless, because the reviewer stops reading it in week two. False positives are what kills this category of tool, so the harness fails on a single one.
-
-The eval also earns its keep as a regression suite: the substring bug where `provider` always looked present inside `service provider` — and made every document report a consistency problem it did not have — is now a permanent case.
-
-## Cost and latency
-
-| Path | Latency | Cost |
+| File | Lines | What it holds |
 | --- | --- | --- |
-| Deterministic checks | <10 ms for a 2,000-word document | 0 |
-| Model adjudication | ~2 s, one call | fractions of a cent |
+| `termcheck/checks.py` | ~230 | Glossary parsing, segmentation, alignment, the four checks |
+| `termcheck/semantic.py` | ~75 | Adjudication prompt, segment-scoped payload, verdict handling |
+| `termcheck/server.py` | ~65 | FastAPI app, `/api/check` |
+| `termcheck/web/index.html` | ~290 | Full UI including the synchronized highlight |
+| `termcheck/cli.py` | ~50 | Arguments, `--fail-on` exit codes for CI |
+| `termcheck/report.py` | ~35 | Text and dict rendering |
+| `evals/run_eval.py` | ~110 | 11 seeded cases, recall and false-positive counts |
+| `tests/smoke.py` | ~75 | 16 assertions: each check fires, the overlap fix holds, plus the API |
 
-A working linguist checking six documents a night pays cents a month. That is the point of pushing everything possible into the free layer: the tool has to be cheap enough that using it is never a decision.
+## Evals
 
-## Failure modes
+Ground truth by construction. Start from a target known to be clean, inject one specific defect, check whether it is reported.
 
-| Failure | How it shows up | Mitigation |
-| --- | --- | --- |
-| Segment misalignment | One merged or split sentence shifts every later pair | Count mismatch is reported as a warning and the tool falls back to whole-document checking rather than producing confidently wrong segment numbers |
-| Multi-word terms crossing a sentence boundary | Missed entirely | Known gap, unhandled |
-| A glossary that is itself wrong | Confident enforcement of a bad term | Out of scope, and worth saying so plainly — this tool enforces a glossary, it does not validate one |
-| Homographs | A term flagged in a segment where the source word means something else | Real false-positive source; the model pass catches some, not all |
-| Numbers written as words | "thirty days" against "30 days" | Not handled. Would need per-language numeral parsing |
-| Very long documents | Alignment drift compounds | Practical ceiling around 200 segments before manual splitting is better |
+Seven seeded defects: unapproved synonym, wrong legal term of art, dropped term, changed number, dropped number, inconsistent rendering, untranslated fragment. Four cases that must stay clean: the unmodified text, two harmless rewordings, and one substitution of an accepted alternative that should produce a `note` and never an error.
 
-## UX decisions
+**Current result, offline: 7/7 recall, 4/4 clean.** That is against the offline stub, which approximates a stemmer. It is a real result for the deterministic layer, which does most of the work here — but it does not tell you how the model adjudication performs on genuine inflection, because the offline stub is not doing inflection. That comparison is unrun.
 
-- **Findings are ranked by severity, then position.** A linguist at 1am reads from the top and stops when they run out of time, so the first thing on screen has to be the thing that gets the deliverable returned.
-- **The bilingual tether.** Clicking a finding highlights the term in the source *and* every candidate rendering in the target at the same time. A terminology decision is never about one side of the page, and making the reader hunt for the counterpart in the other column is where the tool would have lost its time saving.
-- **Three severities, and `note` is not a bug.** Using an accepted alternative instead of the preferred term is worth knowing and is not worth blocking. Collapsing everything into "problem" is how a checker teaches people to ignore it.
-- **The empty state states what was actually verified** — "every glossary term in the source has an approved rendering in the matching target segment, and the numbers agree" — rather than a green checkmark. A reviewer needs to know the scope of the reassurance.
-- **`--fail-on` for CI.** So a terminology check can block a delivery pipeline rather than being a step someone remembers.
-- **"Load sample" says two terms are wrong on purpose.** A demo that looks clean teaches nothing.
-- **Monospace for terms throughout.** Terms are data, and in a bilingual interface an exact glyph is the thing being judged.
+The eval is also a regression suite. The `provider` / `service provider` substring bug is a permanent case in it.
 
-## What I would do next
+## Limits
 
-1. **Ship it to ten interpreters and watch.** Everything below this line is a guess until that happens.
-2. **`.docx` and `.sdlxliff` input.** Nobody's deliverable is a plain text file. This is the single largest gap between "works" and "used".
-3. **Glossary import from TBX and CSV exports** of the tools people already keep terminology in.
-4. **Term suggestion mode**: propose glossary entries from a corpus of past accepted work, so a freelancer with fifteen years of files gets a glossary without writing one.
-5. **Number-word parsing** for the languages this is aimed at.
+- Alignment is positional. One merged or split sentence shifts every later pair; the tool warns and degrades to whole-document rather than reporting wrong segment numbers.
+- Multi-word terms crossing a sentence boundary are missed.
+- Numbers written as words ("thirty days" vs "30 days") are not matched.
+- Homographs produce false positives the model pass only partly catches.
+- Plain text input only. No `.docx`, no `.sdlxliff`. This is the main thing standing between "works" and "usable on real deliverables".
+- The glossary is enforced, never validated. A wrong glossary gets enforced confidently.
+
+## Model
+
+Sonnet at temperature 0, one call per document at most. `--fail-on error|warning|note|never` controls the exit code for pipeline use.
